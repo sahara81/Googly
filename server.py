@@ -1,109 +1,64 @@
 import os
-import re
 import requests
 from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-# Telegram token env se lo
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN environment variable set nahi mila!")
+    raise RuntimeError("TELEGRAM_TOKEN env var missing")
+if not SERPAPI_KEY:
+    raise RuntimeError("SERPAPI_KEY env var missing")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+SERPAPI_URL = "https://serpapi.com/search"
 
 
-# ----------------- GOOGLE RATING FUNCTION -----------------
+# ----------------- GOOGLE USERS RATING VIA SERPAPI -----------------
 def get_google_rating(query: str) -> str:
-    # Search text generic rakha, movie/series both ke liye chalega
-    search_text = f"{query} google users rating"
-    params = {"q": search_text}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "hl": "en",
+        "gl": "in",
+        "device": "desktop",
     }
 
     try:
-        res = requests.get("https://www.google.com/search", params=params, headers=headers, timeout=10)
-        print("Google final URL:", res.url)
-        res.raise_for_status()
+        r = requests.get(SERPAPI_URL, params=params, timeout=15)
+        r.raise_for_status()
     except Exception as e:
-        print("Google HTTP error:", e)
-        return "Google se rating fetch karte waqt error aa gaya."
+        print("SerpAPI HTTP error:", e)
+        return "Google se rating fetch karte waqt error aa gaya. (SerpAPI)"
 
-    soup = BeautifulSoup(res.text, "html.parser")
+    data = r.json()
+    kg = data.get("knowledge_graph") or {}
 
-    # ---------- 1) Specific Google users block dhoondo ----------
-    try:
-        block = soup.select_one("div[data-attrid='kc:/ugc:thumbs_up']")
-    except Exception as e:
-        print("select_one error:", e)
-        block = None
+    # docs ke hisaab se: knowledge_graph.user_statistics.platform/statistic 
+    user_stats = kg.get("user_statistics")
 
-    if block:
-        text = block.get_text(" ", strip=True)
-        print("Block text:", text)
-        m = re.search(r"(\d{1,3})\s*%", text)
-        if m:
-            return f"{m.group(1)}% Google users liked this."
+    # expected structure: dict with keys platform + statistic
+    if isinstance(user_stats, dict):
+        platform = user_stats.get("platform", "")
+        stat = user_stats.get("statistic", "")
+        if platform and stat:
+            return f"{platform}: {stat}"
 
-    # ---------- 2) aria-label based search (kuch pages aise hote hain) ----------
-    try:
-        span = soup.select_one("span[aria-label*='Google users']")
-        if span:
-            text = span.get("aria-label", "")
-            print("aria-label text:", text)
-            m = re.search(r"(\d{1,3})\s*%", text)
-            if m:
-                return f"{m.group(1)}% Google users liked this."
-    except Exception as e:
-        print("aria-label search error:", e)
-
-    # ---------- 3) Fallback: poore page me se likely line dhoondo ----------
-    full_text = soup.get_text(" ", strip=True)
-    print("Page text snippet:", full_text[:400])
-
-    patterns = [
-        r"(\d{1,3})\s*%\s*Google users",
-        r"Google users[^0-9]{0,30}(\d{1,3})\s*%",
-        r"(\d{1,3})\s*%\s*of Google users",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, full_text)
-        if m:
-            return f"{m.group(1)}% Google users liked this."
-
-    # ---------- 4) Extreme fallback: koi bhi % lo jisme nearby 'Google' aa raha ho ----------
-    perc_candidates = re.finditer(r"(\d{1,3})\s*%", full_text)
-    for match in perc_candidates:
-        start = max(0, match.start() - 80)
-        end = min(len(full_text), match.end() + 80)
-        snippet = full_text[start:end]
-        if "Google" in snippet or "users" in snippet:
-            print("Snippet candidate:", snippet)
-            return f"{match.group(1)}% (likely Google users rating, exact text parse nahi ho paya)."
-
-    # ---------- 5) Still nahi mila ----------
-    return "Is title ke liye Google users rating nahi mila."
+    return "Is title ke liye Google users rating SerpAPI se nahi mili."
 
 
 # ----------------- TELEGRAM SEND FUNCTION -----------------
 def send_message(chat_id: int, text: str):
     try:
-        r = requests.post(
+        resp = requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-            },
+            json={"chat_id": chat_id, "text": text},
             timeout=10,
         )
-        print("sendMessage status:", r.status_code, r.text)
+        print("sendMessage:", resp.status_code, resp.text)
     except Exception as e:
         print("Telegram send error:", e)
 
@@ -133,26 +88,25 @@ def webhook():
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "Welcome!\n"
+            "Google Users Rating Bot 😈\n\n"
             "Use:\n"
             "/rate <movie ya series ka naam>\n\n"
             "Example:\n"
-            "/rate Avengers\n"
-            "/rate Mirzapur\n"
-            "/rate Dark"
+            "/rate Dark\n"
+            "/rate Avengers Endgame\n"
+            "/rate Mirzapur"
         )
         return jsonify({"ok": True})
 
     # /rate
     if text.startswith("/rate"):
         parts = text.split(" ", 1)
-
         if len(parts) == 1 or not parts[1].strip():
             send_message(chat_id, "Usage: /rate <title>\nExample: /rate Money Heist")
             return jsonify({"ok": True})
 
         query = parts[1].strip()
-        send_message(chat_id, f"\"{query}\" ke liye Google rating dhoond raha hun...")
+        send_message(chat_id, f"\"{query}\" ke liye Google users rating dhoond raha hun...")
 
         rating = get_google_rating(query)
         reply = f"Title: {query}\n\n{rating}"
@@ -165,5 +119,4 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # Local test ke liye
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
