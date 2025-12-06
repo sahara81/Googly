@@ -5,169 +5,137 @@ from justwatch import JustWatch
 
 app = Flask(__name__)
 
-# -------- ENV Vars ----------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+# -------- ENV VARS --------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SERPAPI = os.getenv("SERPAPI_KEY")
+TMDB = os.getenv("TMDB_API_KEY")
+OMDB = os.getenv("OMDB_API_KEY")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-SERPAPI_URL = "https://serpapi.com/search"
-TMDB_BASE_URL = "https://api.themoviedb.org/3"
-OMDB_URL = "https://www.omdbapi.com/"
+TG = f"https://api.telegram.org/bot{TOKEN}"
+TMDB_URL = "https://api.themoviedb.org/3"
+REGION = "US"   # 🔥 FIXED USA REGION
 
-
-# ------------- GOOGLE RATING -------------
-def get_google_rating(title):
-    params = {
-        "engine": "google",
-        "q": title,
-        "api_key": SERPAPI_KEY,
-        "hl": "en",
-        "gl": "us"
-    }
-
+# -------- GOOGLE RATING --------
+def google_rating(title):
     try:
-        r = requests.get(SERPAPI_URL, params=params, timeout=10)
-        data = r.json()
-        kg = data.get("knowledge_graph", {})
-        stats = kg.get("user_statistics", {})
-        platform = stats.get("platform")
-        stat = stats.get("statistic")
-
-        if platform and stat:
-            return f"{platform}: {stat}"
+        r = requests.get(
+            "https://serpapi.com/search",
+            params={"engine": "google", "q": title, "api_key": SERPAPI, "hl": "en", "gl": "us"}
+        ).json()
+        stats = r.get("knowledge_graph", {}).get("user_statistics", {})
+        if stats:
+            return f"{stats.get('platform')}: {stats.get('statistic')}"
         return "Google rating not available."
-
     except:
-        return "Error getting Google rating."
+        return "Error fetching Google rating."
 
 
-# ------------- TMDB SEARCH -------------
-def tmdb_search(query):
-    url = f"{TMDB_BASE_URL}/search/multi"
-    params = {"query": query, "api_key": TMDB_API_KEY}
+# -------- TMDB SEARCH --------
+def tmdb_search(title):
+    res = requests.get(
+        f"{TMDB_URL}/search/multi",
+        params={"api_key": TMDB, "query": title}
+    ).json().get("results", [])
 
-    r = requests.get(url, params=params).json().get("results", [])
-    
-    for i in r:
-        if i.get("media_type") in ("movie", "tv"):
-            return {
-                "id": i.get("id"),
-                "type": i.get("media_type"),
-                "title": i.get("title") or i.get("name"),
-                "year": (i.get("release_date") or i.get("first_air_date") or "")[:4]
-            }
+    for item in res:
+        if item.get("media_type") in ("movie", "tv"):
+            return item
     return None
 
 
-# ------------- TMDB DETAILS (Languages) -------------
-def get_languages(media_type, tmdb_id):
-    url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}"
-    params = {"api_key": TMDB_API_KEY}
+# -------- TMDB LANGUAGES --------
+def languages(media, tmdb_id):
+    data = requests.get(
+        f"{TMDB_URL}/{media}/{tmdb_id}",
+        params={"api_key": TMDB}
+    ).json()
 
-    langs = []
-    data = requests.get(url, params=params).json()
-
-    for l in data.get("spoken_languages", []):
-        langs.append(l.get("english_name"))
-
-    return langs or ["Not listed"]
+    langs = [x["english_name"] for x in data.get("spoken_languages", [])]
+    return ", ".join(langs) if langs else "Not listed"
 
 
-# ------------- GET IMDb ID -> IMDb Rating -------------
-def get_imdb_id(media_type, tmdb_id):
-    url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}/external_ids"
-    r = requests.get(url, params={"api_key": TMDB_API_KEY}).json()
-    return r.get("imdb_id")
+# -------- IMDb --------
+def imdb_rating(media, tmdb_id):
+    ext = requests.get(
+        f"{TMDB_URL}/{media}/{tmdb_id}/external_ids",
+        params={"api_key": TMDB}
+    ).json()
 
-
-def get_imdb_rating(imdb_id):
+    imdb_id = ext.get("imdb_id")
     if not imdb_id:
         return "IMDb rating not found."
 
-    params = {"apikey": OMDB_API_KEY, "i": imdb_id}
-    r = requests.get(OMDB_URL, params=params).json()
+    res = requests.get(
+        "https://www.omdbapi.com/",
+        params={"apikey": OMDB, "i": imdb_id}
+    ).json()
 
-    if r.get("Response") == "True":
-        return f"IMDb: {r.get('imdbRating')}/10 ({r.get('imdbVotes')} votes)"
+    if res.get("Response") == "True":
+        return f"{res['imdbRating']}/10 ({res['imdbVotes']} votes)"
     return "IMDb rating not available."
 
 
-# ------------- JUSTWATCH USA OTT -------------
-def get_ott_usa(title):
+# -------- OTT (USA ONLY via JustWatch) --------
+def ott(title):
     try:
-        jw = JustWatch(country="US")
-        res = jw.search_for_item(query=title)
-        item = res["items"][0]
+        jw = JustWatch(country=REGION)
+        item = jw.search_for_item(query=title)["items"][0]
+        offers = item.get("offers", [])
+        ids = {x["provider_id"] for x in offers if x["monetization_type"] == "flatrate"}
 
-        providers = set()
-        for offer in item.get("offers", []):
-            if offer.get("monetization_type") == "flatrate":
-                providers.add(offer.get("provider_id"))
+        providers = jw.get_providers()
+        names = [p["clear_name"] for p in providers if p["id"] in ids]
 
-        # Map provider IDs to readable names
-        mapping = jw.get_providers()
-
-        readable = []
-        for p in mapping:
-            if p["id"] in providers:
-                readable.append(p["clear_name"])
-
-        return readable or ["Not available in USA."]
+        return ", ".join(names) if names else "Not available in USA."
     except:
-        return ["Error fetching OTT info."]
+        return "OTT data not available."
 
 
-# ------------- TELEGRAM SEND -------------
-def send(chat_id, text):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+# -------- TELEGRAM SEND --------
+def send(chat, text):
+    requests.post(f"{TG}/sendMessage", json={"chat_id": chat, "text": text})
 
 
-# ------------- MAIN BOT -------------
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+# -------- WEBHOOK HANDLER --------
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    update = request.get_json() or {}
-    msg = update.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "")
+    data = request.get_json()
+    text = data.get("message", {}).get("text", "")
+    chat = data.get("message", {}).get("chat", {}).get("id")
 
     if text.startswith("/start"):
-        send(chat_id, "Send:\n `/rate <movie or show>`")
-        return {"ok": True}
+        send(chat, "Send:\n/rate <movie/show>\nExample: /rate Money Heist")
+        return jsonify(ok=True)
 
     if text.startswith("/rate"):
-        name = text.replace("/rate", "").strip()
+        q = text.replace("/rate", "").strip()
+        info = tmdb_search(q)
 
-        tmdb = tmdb_search(name)
+        if not info:
+            send(chat, "Not found.")
+            return jsonify(ok=True)
 
-        if not tmdb:
-            send(chat_id, "Not found on TMDb.")
-            return {"ok": True}
-
-        google = get_google_rating(tmdb["title"])
-        imdb_id = get_imdb_id(tmdb["type"], tmdb["id"])
-        imdb = get_imdb_rating(imdb_id)
-        langs = get_languages(tmdb["type"], tmdb["id"])
-        ott = get_ott_usa(tmdb["title"])
+        title = info.get("title") or info.get("name")
+        year = (info.get("release_date") or info.get("first_air_date") or "")[:4]
+        media = info["media_type"]
 
         reply = f"""
-🎬 {tmdb['title']} ({tmdb['year']})
+🎬 {title} ({year})
 
-📍 Google: {google}
-⭐ {imdb}
+📍 Google: {google_rating(title)}
+⭐ IMDb: {imdb_rating(media, info['id'])}
 
-🎤 Dubbed / Languages:
-{", ".join(langs)}
+🎤 Languages:
+{languages(media, info['id'])}
 
 📺 Available in USA:
-{", ".join(ott)}
-"""
+{ott(title)}
+""".strip()
 
-        send(chat_id, reply.strip())
-        return {"ok": True}
+        send(chat, reply)
+        return jsonify(ok=True)
 
-    return {"ok": True}
+    return jsonify(ok=True)
 
 
 @app.route("/")
