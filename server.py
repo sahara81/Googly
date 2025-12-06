@@ -1,282 +1,179 @@
 import os
 import requests
 from flask import Flask, request, jsonify
+from justwatch import JustWatch
 
 app = Flask(__name__)
 
-# -------- ENV VARS ----------
+# -------- ENV Vars ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN env var missing")
-if not SERPAPI_KEY:
-    raise RuntimeError("SERPAPI_KEY env var missing")
-if not TMDB_API_KEY:
-    raise RuntimeError("TMDB_API_KEY env var missing")
-if not OMDB_API_KEY:
-    raise RuntimeError("OMDB_API_KEY env var missing")
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SERPAPI_URL = "https://serpapi.com/search"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
-OMDB_BASE_URL = "https://www.omdbapi.com/"
+OMDB_URL = "https://www.omdbapi.com/"
 
 
-# ---------- GOOGLE USERS (SerpAPI) ----------
-def get_google_rating(title: str) -> str:
+# ------------- GOOGLE RATING -------------
+def get_google_rating(title):
     params = {
         "engine": "google",
         "q": title,
         "api_key": SERPAPI_KEY,
         "hl": "en",
-        "gl": "in",
-        "device": "desktop",
+        "gl": "us"
     }
+
     try:
-        r = requests.get(SERPAPI_URL, params=params, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print("SerpAPI HTTP error:", e)
-        return "Google: error while fetching rating."
+        r = requests.get(SERPAPI_URL, params=params, timeout=10)
+        data = r.json()
+        kg = data.get("knowledge_graph", {})
+        stats = kg.get("user_statistics", {})
+        platform = stats.get("platform")
+        stat = stats.get("statistic")
 
-    data = r.json()
-    kg = data.get("knowledge_graph") or {}
-    user_stats = kg.get("user_statistics")
-
-    # Expected: {"platform": "Google users", "statistic": "97% liked this TV show"}
-    if isinstance(user_stats, dict):
-        platform = user_stats.get("platform", "")
-        stat = user_stats.get("statistic", "")
         if platform and stat:
             return f"{platform}: {stat}"
+        return "Google rating not available."
 
-    return "Google: users rating not available."
+    except:
+        return "Error getting Google rating."
 
 
-# ---------- TMDb SEARCH (movie / tv) ----------
-def search_tmdb(query: str):
+# ------------- TMDB SEARCH -------------
+def tmdb_search(query):
     url = f"{TMDB_BASE_URL}/search/multi"
-    params = {
-        "api_key": TMDB_API_KEY,
-        "query": query,
-        "language": "en-US",
-        "include_adult": "false",
-    }
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print("TMDb search error:", e)
-        return None
+    params = {"query": query, "api_key": TMDB_API_KEY}
 
-    results = r.json().get("results") or []
-    for item in results:
-        media_type = item.get("media_type")
-        if media_type in ("movie", "tv"):
+    r = requests.get(url, params=params).json().get("results", [])
+    
+    for i in r:
+        if i.get("media_type") in ("movie", "tv"):
             return {
-                "tmdb_id": item.get("id"),
-                "media_type": media_type,
-                "title": item.get("title") or item.get("name"),
-                "year": (item.get("release_date") or item.get("first_air_date") or "")[:4],
+                "id": i.get("id"),
+                "type": i.get("media_type"),
+                "title": i.get("title") or i.get("name"),
+                "year": (i.get("release_date") or i.get("first_air_date") or "")[:4]
             }
     return None
 
 
-# ---------- TMDb DETAILS + OTT + LANGUAGES ----------
-def get_tmdb_details(media_type: str, tmdb_id: int):
-    details_url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}"
-    providers_url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}/watch/providers"
+# ------------- TMDB DETAILS (Languages) -------------
+def get_languages(media_type, tmdb_id):
+    url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}"
+    params = {"api_key": TMDB_API_KEY}
 
-    spoken_languages = []
-    ott_list = []
+    langs = []
+    data = requests.get(url, params=params).json()
 
-    # Languages
-    try:
-        r = requests.get(details_url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        langs = data.get("spoken_languages") or []
-        for lang in langs:
-            name = lang.get("english_name") or lang.get("name")
-            if name and name not in spoken_languages:
-                spoken_languages.append(name)
-    except Exception as e:
-        print("TMDb details error:", e)
+    for l in data.get("spoken_languages", []):
+        langs.append(l.get("english_name"))
 
-    # OTT providers (India)
-    try:
-        r = requests.get(providers_url, params={"api_key": TMDB_API_KEY}, timeout=15)
-        r.raise_for_status()
-        pdata = r.json()
-        country = pdata.get("results", {}).get("IN") or {}
-        for key in ("flatrate", "buy", "rent"):
-            providers = country.get(key) or []
-            for p in providers:
-                name = p.get("provider_name")
-                if name and name not in ott_list:
-                    ott_list.append(name)
-    except Exception as e:
-        print("TMDb providers error:", e)
-
-    return {
-        "spoken_languages": spoken_languages,
-        "ott_platforms": ott_list,
-    }
+    return langs or ["Not listed"]
 
 
-# ---------- TMDb -> IMDb ID ----------
-def get_imdb_id(media_type: str, tmdb_id: int):
+# ------------- GET IMDb ID -> IMDb Rating -------------
+def get_imdb_id(media_type, tmdb_id):
     url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}/external_ids"
-    try:
-        r = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        imdb_id = data.get("imdb_id")
-        return imdb_id
-    except Exception as e:
-        print("TMDb external_ids error:", e)
-        return None
+    r = requests.get(url, params={"api_key": TMDB_API_KEY}).json()
+    return r.get("imdb_id")
 
 
-# ---------- IMDb rating via OMDb ----------
-def get_imdb_rating(imdb_id: str):
+def get_imdb_rating(imdb_id):
     if not imdb_id:
-        return "IMDb: not available."
+        return "IMDb rating not found."
 
     params = {"apikey": OMDB_API_KEY, "i": imdb_id}
+    r = requests.get(OMDB_URL, params=params).json()
+
+    if r.get("Response") == "True":
+        return f"IMDb: {r.get('imdbRating')}/10 ({r.get('imdbVotes')} votes)"
+    return "IMDb rating not available."
+
+
+# ------------- JUSTWATCH USA OTT -------------
+def get_ott_usa(title):
     try:
-        r = requests.get(OMDB_BASE_URL, params=params, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print("OMDb HTTP error:", e)
-        return "IMDb: error while fetching rating."
+        jw = JustWatch(country="US")
+        res = jw.search_for_item(query=title)
+        item = res["items"][0]
 
-    data = r.json()
-    if data.get("Response") != "True":
-        return "IMDb: not available."
+        providers = set()
+        for offer in item.get("offers", []):
+            if offer.get("monetization_type") == "flatrate":
+                providers.add(offer.get("provider_id"))
 
-    rating = data.get("imdbRating")
-    votes = data.get("imdbVotes")
-    if rating:
-        if votes:
-            return f"IMDb: {rating}/10 (based on {votes} votes)"
-        return f"IMDb: {rating}/10"
-    return "IMDb: not available."
+        # Map provider IDs to readable names
+        mapping = jw.get_providers()
 
+        readable = []
+        for p in mapping:
+            if p["id"] in providers:
+                readable.append(p["clear_name"])
 
-# ---------- TELEGRAM SEND ----------
-def send_message(chat_id: int, text: str):
-    try:
-        resp = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=15,
-        )
-        print("sendMessage:", resp.status_code, resp.text)
-    except Exception as e:
-        print("Telegram send error:", e)
+        return readable or ["Not available in USA."]
+    except:
+        return ["Error fetching OTT info."]
 
 
-# ---------- ROUTES ----------
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot Running Successfully", 200
+# ------------- TELEGRAM SEND -------------
+def send(chat_id, text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 
+# ------------- MAIN BOT -------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
-    update = request.get_json(silent=True, force=True) or {}
-    print("Update:", update)
+    update = request.get_json() or {}
+    msg = update.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
 
-    message = update.get("message")
-    if not message:
-        return jsonify({"ok": True})
-
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "")
-
-    if not isinstance(text, str):
-        return jsonify({"ok": True})
-
-    # /start
     if text.startswith("/start"):
-        send_message(
-            chat_id,
-            "Google + IMDb + Dubbed + OTT Bot 😈\n\n"
-            "Use:\n"
-            "/rate <movie ya series ka naam>\n\n"
-            "Example:\n"
-            "/rate Dark\n"
-            "/rate Avengers Endgame\n"
-            "/rate Mirzapur"
-        )
-        return jsonify({"ok": True})
+        send(chat_id, "Send:\n `/rate <movie or show>`")
+        return {"ok": True}
 
-    # /rate
     if text.startswith("/rate"):
-        parts = text.split(" ", 1)
-        if len(parts) == 1 or not parts[1].strip():
-            send_message(chat_id, "Usage: /rate <title>\nExample: /rate Money Heist")
-            return jsonify({"ok": True})
+        name = text.replace("/rate", "").strip()
 
-        query = parts[1].strip()
+        tmdb = tmdb_search(name)
 
-        # Step 1: TMDb search
-        tmdb_result = search_tmdb(query)
-        if not tmdb_result:
-            google_info = get_google_rating(query)
-            reply = (
-                f"Title: {query}\n\n"
-                f"{google_info}\n"
-                "TMDb/IMDb/OTT data not found."
-            )
-            send_message(chat_id, reply)
-            return jsonify({"ok": True})
+        if not tmdb:
+            send(chat_id, "Not found on TMDb.")
+            return {"ok": True}
 
-        media_type = tmdb_result["media_type"]
-        tmdb_id = tmdb_result["tmdb_id"]
-        title = tmdb_result["title"]
-        year = tmdb_result["year"]
+        google = get_google_rating(tmdb["title"])
+        imdb_id = get_imdb_id(tmdb["type"], tmdb["id"])
+        imdb = get_imdb_rating(imdb_id)
+        langs = get_languages(tmdb["type"], tmdb["id"])
+        ott = get_ott_usa(tmdb["title"])
 
-        # Step 2: Google users rating (title + year)
-        google_info = get_google_rating(f"{title} {year}" if year else title)
+        reply = f"""
+🎬 {tmdb['title']} ({tmdb['year']})
 
-        # Step 3: TMDb details -> languages + OTT
-        extra = get_tmdb_details(media_type, tmdb_id)
-        langs = extra["spoken_languages"]
-        otts = extra["ott_platforms"]
+📍 Google: {google}
+⭐ {imdb}
 
-        langs_text = ", ".join(langs) if langs else "Not clear / not listed."
-        ott_text = ", ".join(otts) if otts else "No OTT info for India (TMDb)."
+🎤 Dubbed / Languages:
+{", ".join(langs)}
 
-        # Step 4: IMDb rating
-        imdb_id = get_imdb_id(media_type, tmdb_id)
-        imdb_info = get_imdb_rating(imdb_id)
+📺 Available in USA:
+{", ".join(ott)}
+"""
 
-        reply_lines = [
-            f"Title: {title} ({year})" if year else f"Title: {title}",
-            "",
-            google_info,
-            imdb_info,
-            "",
-            "Dubbed / Spoken languages (TMDb):",
-            langs_text,
-            "",
-            "OTT in India (TMDb watch/providers):",
-            ott_text,
-        ]
-        reply = "\n".join(reply_lines)
+        send(chat_id, reply.strip())
+        return {"ok": True}
 
-        send_message(chat_id, reply)
-        return jsonify({"ok": True})
+    return {"ok": True}
 
-    # unknown
-    send_message(chat_id, "Unknown command. Use: /rate <title>")
-    return jsonify({"ok": True})
+
+@app.route("/")
+def home():
+    return "Running", 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run()
