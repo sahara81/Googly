@@ -16,9 +16,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ----------------- GOOGLE RATING FUNCTION -----------------
 def get_google_rating(query: str) -> str:
-    # Search ko thoda specific banaya
-    search_text = f"{query} movie google users rating"
-    params = {"q": search_text, "hl": "en"}
+    # Search text generic rakha, movie/series both ke liye chalega
+    search_text = f"{query} google users rating"
+    params = {"q": search_text}
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -29,6 +29,7 @@ def get_google_rating(query: str) -> str:
 
     try:
         res = requests.get("https://www.google.com/search", params=params, headers=headers, timeout=10)
+        print("Google final URL:", res.url)
         res.raise_for_status()
     except Exception as e:
         print("Google HTTP error:", e)
@@ -36,25 +37,40 @@ def get_google_rating(query: str) -> str:
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # 1) Pehle exact 'Google users' rating block pakadne ki koshish
-    rating_block = None
+    # ---------- 1) Specific Google users block dhoondo ----------
     try:
-        rating_block = soup.select_one("div[data-attrid='kc:/ugc:thumbs_up']")
+        block = soup.select_one("div[data-attrid='kc:/ugc:thumbs_up']")
     except Exception as e:
         print("select_one error:", e)
+        block = None
 
-    if rating_block:
-        text = rating_block.get_text(" ", strip=True)
-        m = re.search(r"(\d{1,3})%", text)
+    if block:
+        text = block.get_text(" ", strip=True)
+        print("Block text:", text)
+        m = re.search(r"(\d{1,3})\s*%", text)
         if m:
             return f"{m.group(1)}% Google users liked this."
 
-    # 2) Agar upar se nahi mila, full text me fallback search
+    # ---------- 2) aria-label based search (kuch pages aise hote hain) ----------
+    try:
+        span = soup.select_one("span[aria-label*='Google users']")
+        if span:
+            text = span.get("aria-label", "")
+            print("aria-label text:", text)
+            m = re.search(r"(\d{1,3})\s*%", text)
+            if m:
+                return f"{m.group(1)}% Google users liked this."
+    except Exception as e:
+        print("aria-label search error:", e)
+
+    # ---------- 3) Fallback: poore page me se likely line dhoondo ----------
     full_text = soup.get_text(" ", strip=True)
+    print("Page text snippet:", full_text[:400])
 
     patterns = [
-        r"(\d{1,3})%\s+Google users",
-        r"Google users[^0-9]*(\d{1,3})%"
+        r"(\d{1,3})\s*%\s*Google users",
+        r"Google users[^0-9]{0,30}(\d{1,3})\s*%",
+        r"(\d{1,3})\s*%\s*of Google users",
     ]
 
     for pat in patterns:
@@ -62,7 +78,17 @@ def get_google_rating(query: str) -> str:
         if m:
             return f"{m.group(1)}% Google users liked this."
 
-    # 3) Still nahi mila
+    # ---------- 4) Extreme fallback: koi bhi % lo jisme nearby 'Google' aa raha ho ----------
+    perc_candidates = re.finditer(r"(\d{1,3})\s*%", full_text)
+    for match in perc_candidates:
+        start = max(0, match.start() - 80)
+        end = min(len(full_text), match.end() + 80)
+        snippet = full_text[start:end]
+        if "Google" in snippet or "users" in snippet:
+            print("Snippet candidate:", snippet)
+            return f"{match.group(1)}% (likely Google users rating, exact text parse nahi ho paya)."
+
+    # ---------- 5) Still nahi mila ----------
     return "Is title ke liye Google users rating nahi mila."
 
 
@@ -88,7 +114,6 @@ def home():
     return "Bot Running Successfully", 200
 
 
-# IMPORTANT: webhook path me env se aaya hua token hi use ho raha hai
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True, force=True) or {}
@@ -104,7 +129,7 @@ def webhook():
     if not isinstance(text, str):
         return jsonify({"ok": True})
 
-    # /start command
+    # /start
     if text.startswith("/start"):
         send_message(
             chat_id,
@@ -118,7 +143,7 @@ def webhook():
         )
         return jsonify({"ok": True})
 
-    # /rate command
+    # /rate
     if text.startswith("/rate"):
         parts = text.split(" ", 1)
 
@@ -134,11 +159,11 @@ def webhook():
         send_message(chat_id, reply)
         return jsonify({"ok": True})
 
-    # Unknown message
+    # unknown
     send_message(chat_id, "Unknown command. Use: /rate <title>")
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    # Local run ke liye
+    # Local test ke liye
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
